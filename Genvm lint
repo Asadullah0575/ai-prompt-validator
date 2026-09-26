@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""
+genvm_lint.py — a static analyzer for GenLayer Intelligent Contract source
+files (.py contracts written against the py-genlayer SDK).
+
+Unlike a prompt-wording checker, this tool reads actual GenVM contract
+source with Python's `ast` module and flags real structural problems: a
+missing dependency header, a missing `dataclasses` import that GenVM will
+silently fail to load, Equivalence Principle calls that don't match any
+confirmed-working pattern, and URLs that are typed into a prompt string
+without ever actually being fetched.
+
+Every check in this file exists because of a real bug hit while building
+and deploying an actual GenLayer contract — see README.md for the specific
+incidents. This is a linter built from debugging scars, not from reading
+the docs once.
+
+Usage:
+    python genvm_lint.py path/to/contract.py
+    python genvm_lint.py path/to/contract.py --json
+"""
+
+import argparse
+import ast
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class Finding:
+    severity: str  # "error" | "warning" | "info"
+    rule: str
+    line: Optional[int]
+    message: str
+
+
+@dataclass
+class LintResult:
+    file: str
+    findings: list = field(default_factory=list)
+
+    def add(self, severity: str, rule: str, line: Optional[int], message: str):
+        self.findings.append(Finding(severity, rule, line, message))
+
+    @property
+    def error_count(self):
+        return sum(1 for f in self.findings if f.severity == "error")
+
+    @property
+    def warning_count(self):
+        return sum(1 for f in self.findings if f.severity == "warning")
+
+
+DEPENDS_RE = re.compile(r'#\s*\{\s*"Depends"\s*:\s*"py-genlayer:([^"]+)"\s*\}')
+
+NONDET_WEB_CALLS = {"get", "render", "post"}  # gl.nondet.web.*
+NONDET_EXEC_PROMPT = "exec_prompt"  # gl.nondet.exec_prompt
+EQ_PRINCIPLE_NAMES = {"prompt_comparative", "prompt_non_comparative", "strict_eq", "comparative_eq"}
+
+
+def _dotted_name(node: ast.AST) -> str:
+    """Turn an ast.Attribute/ast.Name chain like gl.eq_principle.foo into a string."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _call_target(node: ast.Call) -> str:
+    return _dotted_name(node.func)
+
+
+def _contains_call(node: ast.AST, predicate) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and predicate(_call_target(child)):
+            return True
+    return False
+
+
+def _string_constants(node: ast.AST):
+    """Yield every string literal / f-string piece anywhere under node."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Constant) and isinstance(child.value, str):
+            yield child.value, getattr(child, "lineno", None)
+        elif isinstance(child, ast.JoinedStr):  # f-string
+            for value in child.values:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    yield value.value, getattr(value, "lineno", None)
+
+
+def lint_source(source: str, filename: str = "<contract>") -> LintResult:
+    result = LintResult(file=filename)
+
+    # --- 1. Syntax must be valid Python before anything else matters -------
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError as e:
+        result.add("error", "syntax-error", e.lineno,
+                   f"File does not parse as Python: {e.msg}")
+        return result
+
+    lines = source.splitlines()
+
+    # --- 2. Dependency header -------------------------------------------
+    header_ok = False
+    for i, line in enumerate(lines[:5], start=1):
+        m = DEPENDS_RE.search(line)
+        if m:
+            header_ok = True
+            version = m.group(1)
+            if version in ("test", "latest"):
+                result.add(
+                    "warning", "depends-non-pinned", i,
+                    f"Depends header uses 'py-genlayer:{version}'. This works "
+                    "in a local debug sandbox but hosted Studio (studionet) "
+                    "explicitly refuses non-debug ':test'/':latest' runners "
+                    "('runner used in non-debug mode, this is not allowed'). "
+                    "Pin an exact version hash for anything you intend to "
+                    "deploy to a real network."
+                )
+            break
+    if not header_ok:
+        result.add(
+            "error", "missing-depends-header", 1,
+            'No valid `# { "Depends": "py-genlayer:<version>" }` header found '
+            "in the first 5 lines. GenVM needs this to know which runtime "
+            "to execute the contract with."
+        )
+
+    # --- 3. genlayer import ----------------------------------------------
+    has_genlayer_import = any(
+        isinstance(n, ast.ImportFrom) and n.module == "genlayer"
+        and any(a.name == "*" for a in n.names)
+        for n in ast.walk(tree)
+    )
+    if not has_genlayer_import:
+        result.add(
+            "error", "missing-genlayer-import", None,
+            "No `from genlayer import *` found. Without it, `gl`, `Address`, "
+            "`u256`, `TreeMap`, and every other SDK name used in the file "
+            "will be undefined at contract-load time."
+        )
+
+    # --- 4. dataclass import, if @dataclass is used -----------------------
+    uses_dataclass_decorator = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for dec in node.decorator_list:
+                name = _dotted_name(dec) if isinstance(dec, (ast.Name, ast.Attribute)) else None
+                if name == "dataclass":
+                    uses_dataclass_decorator = True
+
+    has_dataclass_import = any(
+        isinstance(n, ast.ImportFrom) and n.module == "dataclasses"
+        and any(a.name == "dataclass" for a in n.names)
+        for n in ast.walk(tree)
+    )
+
+    if uses_dataclass_decorator and not has_dataclass_import:
+        result.add(
+            "error", "missing-dataclass-import", None,
+            "A class uses @dataclass, but there is no "
+            "`from dataclasses import dataclass`. `from genlayer import *` "
+            "does NOT export `dataclass` — this is a real bug that deploys "
+            "successfully (the deploy transaction reaches consensus) but "
+            "then fails every subsequent `genlayer call` with a generic "
+            "'contract not found' RPC error, which looks exactly like a "
+            "network problem and is not. This exact bug caused a real "
+            "rejected submission."
+        )
+
+    # --- 5. gl.Contract base class ----------------------------------------
+    has_contract_class = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                if _dotted_name(base) == "gl.Contract":
+                    has_contract_class = True
+    if not has_contract_class:
+        result.add(
+            "error", "no-contract-class", None,
+            "No class extends `gl.Contract`. A GenVM contract needs exactly "
+            "this base class to be deployable at all."
+        )
+
+    # --- 6. DynArray + inmem_allocate antipattern --------------------------
+    uses_dynarray = "DynArray[" in source
+    uses_inmem_allocate = _contains_call(
+        tree, lambda t: t == "gl.storage.inmem_allocate"
+    )
+    if uses_dynarray and uses_inmem_allocate:
+        result.add(
+            "warning", "dynarray-inmem-allocate-antipattern", None,
+            "Found `DynArray[...]` storage combined with "
+            "`gl.storage.inmem_allocate(...)` construction. Multiple "
+            "independent developers have reported this specific combination "
+            "as unreliable in the current SDK. The pattern proven to work "
+            "in real deployed contracts is `TreeMap[KeyType, ValueType]` "
+            "storage with plain `MyDataclass(field=value, ...)` "
+            "construction — prefer that instead."
+        )
+
+    # --- 7. Equivalence Principle usage -----------------------------------
+    eq_calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            target = _call_target(node)
+            if target.startswith("gl.eq_principle."):
+                method = target.split(".")[-1]
+                eq_calls.append((node, method))
+
+    if not eq_calls:
+        # Only worth flagging if the contract also does non-deterministic
+        # work without going through eq_principle at all (raw run_nondet_*).
+        if _contains_call(tree, lambda t: t in (
+            "gl.vm.run_nondet_unsafe", "gl.vm.run_nondet",
+            "gl.nondet.exec_prompt", "gl.nondet.web.get",
+        )):
+            result.add(
+                "info", "no-eq-principle-wrapper", None,
+                "Contract performs non-deterministic work (gl.nondet.* / "
+                "gl.vm.run_nondet*) without any gl.eq_principle.* call. "
+                "This is valid (a custom leader/validator function is a "
+                "real, documented pattern) but is also the harder, more "
+                "error-prone path — the high-level gl.eq_principle.* "
+                "wrappers exist specifically to avoid hand-rolling "
+                "validator agreement logic."
+            )
+    else:
+        for node, method in eq_calls:
+            if method == "prompt_non_comparative":
+                # Look for a live web-fetch call inside the callback passed
+                # as the first argument.
+                if node.args:
+                    callback_name = None
+                    first_arg = node.args[0]
+                    if isinstance(first_arg, ast.Name):
+                        callback_name = first_arg.id
+                    if callback_name:
+                        # Find the function definition with this name and
+                        # check its body for a live fetch.
+                        for fn in ast.walk(tree):
+                            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                               and fn.name == callback_name:
+                                if _contains_call(
+                                    fn, lambda t: t in (
+                                        "gl.nondet.web.get", "gl.nondet.web.render",
+                                        "gl.nondet.web.post",
+                                    )
+                                ):
+                                    result.add(
+                                        "warning",
+                                        "nondet-fetch-inside-non-comparative",
+                                        getattr(node, "lineno", None),
+                                        f"`{callback_name}` performs a live "
+                                        "web fetch (gl.nondet.web.*) inside a "
+                                        "callback passed to "
+                                        "prompt_non_comparative. No "
+                                        "confirmed-working public example "
+                                        "combines a live fetch with "
+                                        "prompt_non_comparative — every "
+                                        "working example that fetches "
+                                        "external data (oracle/verification "
+                                        "patterns) uses prompt_comparative "
+                                        "instead, where each validator "
+                                        "independently re-fetches and "
+                                        "re-judges. prompt_non_comparative "
+                                        "examples only ever judge data "
+                                        "already sitting in contract "
+                                        "storage. This exact pattern caused "
+                                        "a contract to deploy, reach full "
+                                        "validator consensus, and still fail "
+                                        "to load with a generic "
+                                        "'invalid_contract' error."
+                                    )
+            if method in ("prompt_comparative", "prompt_non_comparative", "strict_eq"):
+                # These take a natural-language comparison rule / criteria
+                # string. Flag if it looks empty or trivially short.
+                str_args = [
+                    a for a in list(node.args) + [kw.value for kw in node.keywords]
+                    if isinstance(a, (ast.Constant, ast.JoinedStr))
+                ]
+                rule_texts = []
+                for a in str_args:
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                        rule_texts.append(a.value)
+                    elif isinstance(a, ast.JoinedStr):
+                        rule_texts.append("".join(
+                            v.value for v in a.values
+                            if isinstance(v, ast.Constant) and isinstance(v.value, str)
+                        ))
+                if rule_texts and all(len(t.strip()) < 15 for t in rule_texts):
+                    result.add(
+                        "warning", "vague-eq-principle-rule",
+                        getattr(node, "lineno", None),
+                        f"`{method}` is called with a very short comparison/"
+                        "criteria string. If the value being agreed on "
+                        "drives a payout or other state change, the rule "
+                        "should say explicitly which field must match "
+                        "exactly (e.g. \"the `tier` field must match "
+                        "exactly\") — a vague rule can let validators agree "
+                        "on 'close enough' for a number that should have "
+                        "been exact."
+                    )
+
+    # --- 8. URL-as-string antipattern: a URL appears in prompt text but is
+    #        never actually fetched anywhere in the same function. --------
+    url_re = re.compile(r'https?://\S+')
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            urls_in_strings = []
+            for text, lineno in _string_constants(node):
+                for m in url_re.finditer(text):
+                    urls_in_strings.append((m.group(0), lineno))
+
+            calls_exec_prompt = _contains_call(
+                node, lambda t: t.endswith("exec_prompt")
+            )
+            calls_web_fetch = _contains_call(
+                node, lambda t: t in (
+                    "gl.nondet.web.get", "gl.nondet.web.render", "gl.nondet.web.post",
+                )
+            )
+
+            if urls_in_strings and calls_exec_prompt and not calls_web_fetch:
+                for url, lineno in urls_in_strings:
+                    result.add(
+                        "warning", "url-passed-as-string",
+                        lineno,
+                        f"A URL ('{url[:40]}...' ) appears inside a prompt "
+                        f"string passed toward exec_prompt in `{node.name}`, "
+                        "but this function never calls gl.nondet.web.get/"
+                        "render/post. An LLM cannot browse the internet from "
+                        "inside a prompt — if the intent was to fetch that "
+                        "page's content, it needs to be retrieved with "
+                        "gl.nondet.web.get(url) first and the returned body "
+                        "included in the prompt text, not the bare URL."
+                    )
+
+    # --- 9. response_format / JSON parsing without fence-stripping --------
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _call_target(node) in ("json.loads",):
+            arg = node.args[0] if node.args else None
+            arg_name = arg.id if isinstance(arg, ast.Name) else None
+            if arg_name:
+                # Look backwards in the same function for a `.replace(` call
+                # against a triple-backtick pattern applied to this name.
+                enclosing_fn = None
+                for fn in ast.walk(tree):
+                    if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if any(n is node for n in ast.walk(fn)):
+                            enclosing_fn = fn
+                fence_stripped = False
+                if enclosing_fn is not None:
+                    src_segment = ast.get_source_segment(source, enclosing_fn) or ""
+                    if "```" in src_segment or "``" + "`" in src_segment or "replace(" in src_segment:
+                        fence_stripped = True
+                if not fence_stripped:
+                    result.add(
+                        "info", "json-loads-no-fence-strip",
+                        getattr(node, "lineno", None),
+                        "json.loads(...) is called on what looks like a raw "
+                        "LLM response with no visible code-fence stripping "
+                        "nearby. LLMs frequently wrap JSON in ``` fences "
+                        "even when explicitly told not to — this will throw "
+                        "a JSONDecodeError on a fraction of real responses "
+                        "unless the fences are stripped first."
+                    )
+
+    # --- 10. view methods that touch non-determinism ----------------------
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            is_view = any(
+                _dotted_name(d) == "gl.public.view" for d in node.decorator_list
+            )
+            if is_view and _contains_call(
+                node, lambda t: t.startswith("gl.nondet.") or t.startswith("gl.eq_principle.")
+            ):
+                result.add(
+                    "error", "nondeterminism-in-view",
+                    node.lineno,
+                    f"`{node.name}` is decorated @gl.public.view but calls "
+                    "gl.nondet.*/gl.eq_principle.* internally. View methods "
+                    "are for cheap, deterministic reads with no consensus "
+                    "round — non-deterministic work belongs in a "
+                    "@gl.public.write method."
+                )
+
+    return result
+
+
+def format_text(result: LintResult) -> str:
+    lines = [f"genvm-lint: {result.file}"]
+    if not result.findings:
+        lines.append("  no findings — looks structurally sound")
+    for f in result.findings:
+        loc = f" (line {f.line})" if f.line else ""
+        icon = {"error": "✖", "warning": "⚠", "info": "ℹ"}[f.severity]
+        lines.append(f"  {icon} [{f.severity.upper()}] {f.rule}{loc}")
+        lines.append(f"      {f.message}")
+    lines.append("")
+    lines.append(
+        f"{result.error_count} error(s), {result.warning_count} warning(s), "
+        f"{len(result.findings) - result.error_count - result.warning_count} info"
+    )
+    return "\n".join(lines)
+
+
+def format_json(result: LintResult) -> str:
+    return json.dumps({
+        "file": result.file,
+        "findings": [
+            {"severity": f.severity, "rule": f.rule, "line": f.line, "message": f.message}
+            for f in result.findings
+        ],
+        "error_count": result.error_count,
+        "warning_count": result.warning_count,
+    }, indent=2)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("path", help="Path to a GenVM contract .py file")
+    parser.add_argument("--json", action="store_true", help="Output findings as JSON")
+    args = parser.parse_args()
+
+    try:
+        with open(args.path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except OSError as e:
+        print(f"Could not read {args.path}: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    result = lint_source(source, filename=args.path)
+
+    if args.json:
+        print(format_json(result))
+    else:
+        print(format_text(result))
+
+    sys.exit(1 if result.error_count else 0)
+
+
+if __name__ == "__main__":
+    main()
