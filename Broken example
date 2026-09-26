@@ -1,0 +1,37 @@
+# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+from genlayer import *
+
+@allow_storage
+@dataclass
+class Task:
+    creator: Address
+    evidence_url: str
+    status: str
+
+
+class TaskReward(gl.Contract):
+    tasks: DynArray[Task]
+
+    def __init__(self):
+        pass
+
+    @gl.public.write
+    def create_task(self, url: str):
+        task = gl.storage.inmem_allocate(Task, gl.message.sender_address, url, "open")
+        self.tasks.append(task)
+
+    @gl.public.write
+    def verify(self, task_id: int):
+        url = self.tasks[task_id].evidence_url
+
+        def get_input() -> str:
+            page = gl.nondet.web.get(url)
+            return page.body.decode()
+
+        raw = gl.eq_principle.prompt_non_comparative(
+            get_input,
+            task="score it",
+            criteria="ok",
+        )
+        data = json.loads(raw)
+        return data
